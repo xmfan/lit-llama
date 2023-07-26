@@ -64,6 +64,27 @@ class LLaMA(nn.Module):
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[MaskCache] = None
         self.kv_caches: List[KVCache] = []
+        self.max_batch_size = None
+        self.max_seq_length = None
+        # self.compile(mode="reduce-overhead")
+
+    def setup_caches(self, max_batch_size, max_seq_length, device='cuda', dtype=torch.bfloat16):
+        head_size = self.config.n_embd // self.config.n_head
+        cache_shape = (max_batch_size, self.config.n_head, max_seq_length, head_size)
+        self.max_seq_length = max_seq_length
+        self.max_batch_size = max_batch_size
+        self.kv_caches = [
+            (torch.zeros(cache_shape, device=device, dtype=dtype), torch.zeros(cache_shape, device=device, dtype=dtype))
+            for _ in range(self.config.n_layer)
+        ]
+        self.rope_cache = build_rope_cache(
+            seq_len=self.config.block_size,
+            n_elem=self.config.n_embd // self.config.n_head,
+            dtype=dtype,
+            device=device,
+        )
+        ones = torch.ones((self.config.block_size, self.config.block_size), device=device, dtype=torch.bool)
+        self.mask_cache = torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -72,21 +93,17 @@ class LLaMA(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
 
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
 
         block_size = self.config.block_size
+        max_seq_length = self.max_seq_length
         if max_seq_length is None:
             max_seq_length = block_size
         assert T <= max_seq_length, f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
-
-        if self.rope_cache is None:
-            self.rope_cache = self.build_rope_cache(idx)
-        if self.mask_cache is None:
-            self.mask_cache = self.build_mask_cache(idx)
 
         if input_pos is not None:
             rope = self.rope_cache.index_select(0, input_pos)
@@ -103,15 +120,10 @@ class LLaMA(nn.Module):
             for block in self.transformer.h:
                 x, _ = block(x, rope, mask, max_seq_length)
         else:
-            if not self.kv_caches:
-                head_size = self.config.n_embd // self.config.n_head
-                cache_shape = (B, self.config.n_head, max_seq_length, head_size)
-                self.kv_caches = [
-                    (torch.zeros(cache_shape, device=x.device, dtype=x.dtype), torch.zeros(cache_shape, device=x.device, dtype=x.dtype))
-                    for _ in range(self.config.n_layer)
-                ]
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i] = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
+                x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
+                self.kv_caches[i][0].copy_(new_kv_cache[0])
+                self.kv_caches[i][1].copy_(new_kv_cache[1])
 
         x = self.transformer.ln_f(x)
 
@@ -122,18 +134,6 @@ class LLaMA(nn.Module):
     @classmethod
     def from_name(cls, name: str) -> Self:
         return cls(LLaMAConfig.from_name(name))
-
-    def build_rope_cache(self, idx: torch.Tensor) -> RoPECache:
-        return build_rope_cache(
-            seq_len=self.config.block_size,
-            n_elem=self.config.n_embd // self.config.n_head,
-            dtype=idx.dtype,
-            device=idx.device,
-        )
-
-    def build_mask_cache(self, idx: torch.Tensor) -> MaskCache:
-        ones = torch.ones((self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool)
-        return torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
     def reset_cache(self) -> None:
         self.kv_caches.clear()
@@ -209,11 +209,12 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             # check if reached token limit
-            if input_pos[-1] >= max_seq_length:
-                input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
-                # shift 1 position to the left
-                cache_k = torch.roll(cache_k, -1, dims=2)
-                cache_v = torch.roll(cache_v, -1, dims=2)
+            # if input_pos[-1] >= max_seq_length:
+            #     input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
+            #     # shift 1 position to the left
+            #     cache_k = torch.roll(cache_k, -1, dims=2)
+            #     cache_v = torch.roll(cache_v, -1, dims=2)
+
             k = cache_k.index_copy(2, input_pos, k)
             v = cache_v.index_copy(2, input_pos, v)
             kv_cache = k, v
@@ -225,6 +226,8 @@ class CausalSelfAttention(nn.Module):
         #  y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         # efficient attention using Flash Attention CUDA kernels
+        # breakpoint
+        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side

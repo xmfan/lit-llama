@@ -44,6 +44,7 @@ def generate(
     T_new = T + max_new_tokens
     if max_seq_length is None:
         max_seq_length = min(T_new, model.config.block_size)
+    model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     device, dtype = idx.device, idx.dtype
     # create an empty tensor of the expected final shape and fill in the current tokens
@@ -52,17 +53,12 @@ def generate(
     idx = empty
     input_pos = torch.arange(0, T, device=device)
 
-    if idx.device.type == "xla":
-        import torch_xla.core.xla_model as xm
-
-        xm.mark_step()
-
     # generate max_new_tokens tokens
     for _ in range(max_new_tokens):
         x = idx.index_select(0, input_pos).view(1, -1)
 
         # forward
-        logits = model(x, max_seq_length, input_pos)
+        logits = model(x, input_pos)
         logits = logits[0, -1] / temperature
 
         # optionally crop the logits to only the top k options
@@ -75,9 +71,6 @@ def generate(
 
         # advance
         input_pos = input_pos[-1:] + 1
-
-        if idx.device.type == "xla":
-            xm.mark_step()
 
         # concatenate the new generation
         idx = idx.index_copy(0, input_pos, idx_next)
@@ -99,6 +92,7 @@ def main(
     checkpoint_path: Path = Path("checkpoints/lit-llama/7B/lit-llama.pth"),
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
     quantize: Optional[str] = None,
+    fake_weights = False,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -129,28 +123,39 @@ def main(
         with fabric.init_module(empty_init=True), quantization(mode=quantize):
             model = LLaMA.from_name(name)
 
-        model.load_state_dict(checkpoint)
+        if not fake_weights:
+            model.load_state_dict(checkpoint)
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
 
     model.eval()
-    model = fabric.setup(model)
 
     tokenizer = Tokenizer(tokenizer_path)
     encoded = tokenizer.encode(prompt, bos=True, eos=False, device=fabric.device)
     prompt_length = encoded.size(0)
 
     L.seed_everything(1234)
+    model_size = sum([p.numel() * p.data.element_size() for p in model.parameters()])
+    model = torch.compile(model)
     for i in range(num_samples):
+        torch.cuda.synchronize()
         t0 = time.perf_counter()
-        y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
+        import contextlib
+        prof = contextlib.nullcontext() if i != -1 else torch.profiler.profile()
+        with prof:
+            y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
+        if hasattr(prof, "export_chrome_trace"):
+            prof.export_chrome_trace(f"transformer.json")
+        torch.cuda.synchronize()
         t = time.perf_counter() - t0
 
         model.reset_cache()
         print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
+        tokens_sec = tokens_generated / t
         print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
-    if fabric.device.type == "cuda":
-        print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)
+        print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+
+    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -159,12 +164,12 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
     warnings.filterwarnings(
         # Triggered internally at ../aten/src/ATen/EmptyTensor.cpp:31
-        "ignore", 
+        "ignore",
         message="ComplexHalf support is experimental and many operators don't support it yet"
     )
     warnings.filterwarnings(
         # Triggered in bitsandbytes/autograd/_functions.py:298
-        "ignore", 
+        "ignore",
         message="MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization",
     )
     CLI(main)
