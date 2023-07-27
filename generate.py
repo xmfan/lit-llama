@@ -8,6 +8,9 @@ from typing import Optional
 import lightning as L
 import torch
 
+import torch._dynamo.config as config
+config.automatic_dynamic_shapes = False
+
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
@@ -19,7 +22,6 @@ def fast_multinomial_sample_one(probs_sort):
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True)
 
-# @torch.compile
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     logits =  logits[0, -1] / temperature
 
@@ -122,7 +124,7 @@ def generate(
 def main(
     prompt: str = "Hello, my name is",
     prompt_synthetic: Optional[int] = None,
-    num_samples: int = 1,
+    num_samples: int = 3,
     max_new_tokens: int = 50,
     top_k: int = 200,
     temperature: float = 0.8,
@@ -179,7 +181,7 @@ def main(
     if compile:
         global decode_one_token
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
-    #     model = torch.compile(model, mode="reduce-overhead")
+
     for i in range(num_samples):
         torch.cuda.synchronize()
         t0 = time.perf_counter()

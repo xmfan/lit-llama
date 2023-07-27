@@ -45,28 +45,37 @@ llama_configs = {
     "65B": dict(n_layer=80, n_head=64, n_embd=8192),
 }
 
-# HACK: Dynamo doesn't handle list mutation of module attributes properly now, so making it a global
 class KVCache(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_size, device='cuda', dtype=torch.bfloat16):
+        super().__init__()
+        cache_shape = (max_batch_size, n_heads, max_seq_length, head_size)
+        self.k_cache = torch.nn.Parameter(torch.zeros(cache_shape, device=device, dtype=dtype))
+        self.v_cache = torch.nn.Parameter(torch.zeros(cache_shape, device=device, dtype=dtype))
+
+    def update(self, input_pos, k_val, v_val):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k_val.shape[2]
+
+        self.k_cache[:, :, input_pos] = k_val
+        self.v_cache[:, :, input_pos] = v_val
+
+        return self.k_cache, self.v_cache
+
+# HACK: Dynamo doesn't handle list mutation of module attributes properly now, so making it a global
+class KVCacheAggregator(nn.Module):
     def __init__(self):
         super().__init__()
-        self.k_caches = nn.ParameterList([])
-        self.v_caches = nn.ParameterList([])
+        self.kv_caches = nn.ModuleList([])
 
     def initialize(self,layers, max_batch_size, max_seq_length, n_heads, head_size, device='cuda', dtype=torch.bfloat16):
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_size)
-        self.k_caches = nn.ParameterList([torch.zeros(cache_shape, device=device, dtype=dtype) for _ in range(layers)])
-        self.v_caches = nn.ParameterList([torch.zeros(cache_shape, device=device, dtype=dtype) for _ in range(layers)])
+        self.kv_caches = nn.ModuleList([KVCache(max_batch_size, max_seq_length, n_heads, head_size) for _ in range(layers)])
 
     def __getitem__(self, idx):
-        return self.k_caches[idx], self.v_caches[idx]
+        return self.kv_caches[idx]
 
     def clear(self):
-        self.k_caches = nn.ParameterList([])
-        self.v_caches = nn.ParameterList([])
-
-    def update(self, layer, k_val, v_val):
-        self.k_caches[layer].copy_(k_val)
-        self.v_caches[layer].copy_(v_val)
+        self.kv_caches = nn.ParameterList([])
 
 class LLaMA(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -85,7 +94,7 @@ class LLaMA(nn.Module):
 
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[MaskCache] = None
-        self.kv_caches = KVCache()
+        self.kv_caches = KVCacheAggregator()
         self.max_batch_size = None
         self.max_seq_length = None
 
@@ -95,8 +104,6 @@ class LLaMA(nn.Module):
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
         self.kv_caches.initialize(layers=self.config.n_layer, max_batch_size=max_batch_size, max_seq_length=max_seq_length, n_heads=self.config.n_head, head_size=head_size)
-        # for _ in range(self.config.n_layer):
-        #     self.kv_caches.append((torch.zeros(cache_shape, device=device, dtype=dtype), torch.zeros(cache_shape, device=device, dtype=dtype)))
 
         self.rope_cache = build_rope_cache(
             seq_len=self.config.block_size,
@@ -122,29 +129,20 @@ class LLaMA(nn.Module):
         max_seq_length = self.max_seq_length
         if max_seq_length is None:
             max_seq_length = block_size
+
         assert T <= max_seq_length, f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
-        if input_pos is not None:
-            rope = self.rope_cache.index_select(0, input_pos)
-            mask = self.mask_cache.index_select(2, input_pos)
-            mask = mask[:, :, :, :max_seq_length]
-        else:
-            rope = self.rope_cache[:T]
-            mask = self.mask_cache[:, :, :T, :T]
+        rope = self.rope_cache.index_select(0, input_pos)
+        mask = self.mask_cache.index_select(2, input_pos)
+        mask = mask[:, :, :, :max_seq_length]
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
-        if input_pos is None:  # proxy for use_cache=False
-            for block in self.transformer.h:
-                x, _ = block(x, rope, mask, max_seq_length)
-        else:
-            for i, block in enumerate(self.transformer.h):
-                x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
-                self.kv_caches.update(i, new_kv_cache[0], new_kv_cache[1])
-                # kv_caches[i] = new_kv_cache
+        for i, block in enumerate(self.transformer.h):
+            x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
 
         x = self.transformer.ln_f(x)
 
@@ -228,12 +226,7 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, nh, T, hs)
 
         if kv_cache is not None:
-            cache_k, cache_v = kv_cache
-            # check if reached token limit
-
-            k = cache_k.index_copy(2, input_pos, k)
-            v = cache_v.index_copy(2, input_pos, v)
-            kv_cache = k, v
+            k, v = kv_cache.update(input_pos, k, v)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         #  att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -242,7 +235,6 @@ class CausalSelfAttention(nn.Module):
         #  y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
 
         # efficient attention using Flash Attention CUDA kernels
-        # breakpoint
         # y = F.scaled_dot_product_attention(q, k, v)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 

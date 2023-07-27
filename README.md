@@ -18,4 +18,8 @@ Note: Still seems primarily overhead-bound (also, cudagraphs is segfaulting for 
 torch.compile on whole model
 Time for inference 3: 2.66 sec total, 75.13 tokens/sec
 Bandwidth achieved: 1012.55 GB/s
+
+Refactored to also compile sampling code
+Time for inference 3: 1.16 sec total, 86.02 tokens/sec
+Bandwidth achieved: 1159.24 GB/s
 ```
