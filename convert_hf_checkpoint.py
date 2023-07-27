@@ -12,8 +12,8 @@ import torch
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_llama.model import LLaMA, LLaMAConfig
-from lit_llama.utils import EmptyInitOnDevice, lazy_load, incremental_save
+from ..model import LLaMA, LLaMAConfig
+from ..utils import EmptyInitOnDevice, lazy_load, incremental_save
 
 
 @torch.no_grad()
@@ -164,4 +164,3 @@ if __name__ == "__main__":
     from jsonargparse import CLI
 
     CLI(convert_hf_checkpoint)
-

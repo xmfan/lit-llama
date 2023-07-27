@@ -1,32 +1,5 @@
 ## Downloading pretrained weights
 
-Except for when you are training from scratch, you will need the pretrained weights from Meta.
-
-### Original Meta weights
-
-Download the model weights following the instructions on the official [LLaMA repository](https://github.com/facebookresearch/llama).
-
-Once downloaded, you should have a folder like this:
-
-```text
-checkpoints/llama
-├── 7B
-│   ├── ...
-│   └── consolidated.00.pth
-├── 13B
-│   ...
-└── tokenizer.model
-```
-
-Convert the weights to the Lit-LLaMA format:
-
-```bash
-python scripts/convert_checkpoint.py --model_size 7B
-```
-
-> **Note**
-> All scripts support argument [customization](customize_paths.md)
-
 ### OpenLLaMA
 
 OpenLM Research has released **Apache 2.0 licensed** weights obtained by training LLaMA on the 1.2 trillion token open-source [RedPajama](https://github.com/togethercomputer/RedPajama-Data) dataset.
@@ -61,6 +34,32 @@ Convert the weights to the Lit-LLaMA format:
 ```bash
 python scripts/convert_hf_checkpoint.py --checkpoint_dir checkpoints/open-llama/7B --model_size 7B
 ```
+
+### Original Meta weights
+
+Download the model weights following the instructions on the official [LLaMA repository](https://github.com/facebookresearch/llama).
+
+Once downloaded, you should have a folder like this:
+
+```text
+checkpoints/llama
+├── 7B
+│   ├── ...
+│   └── consolidated.00.pth
+├── 13B
+│   ...
+└── tokenizer.model
+```
+
+Convert the weights to the Lit-LLaMA format:
+
+```bash
+python scripts/convert_checkpoint.py --model_size 7B
+```
+
+> **Note**
+> All scripts support argument [customization](customize_paths.md)
+
 
 > **Note**
 > All scripts support argument [customization](customize_paths.md)

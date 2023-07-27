@@ -1,3 +1,13 @@
+To download weights, follow `download_weights.md`. I used OpenLLaMA weights.
+
+To run benchmark.
+
+Model definition in `model.py`, generation code in `generate.py`.
+
+```
+time python generate.py --prompt "Hello, my name is" --max_new_tokens 200 --num_samples 10 --fake false  --compile true
+```
+
 ```
 Current benchmark results
 7B, 6 prompt/200 tokens, bf16
@@ -19,7 +29,7 @@ torch.compile on whole model
 Time for inference 3: 2.66 sec total, 75.13 tokens/sec
 Bandwidth achieved: 1012.55 GB/s
 
-Refactored to also compile sampling code
+Refactored to also compile sampling code (and also updated pytorch)
 Time for inference 3: 1.16 sec total, 86.02 tokens/sec
 Bandwidth achieved: 1159.24 GB/s
 ```

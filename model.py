@@ -12,13 +12,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
-from lit_llama.utils import find_multiple
 
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
+def find_multiple(n: int, k: int) -> int:
+    if n % k == 0:
+        return n
+    return n + k - (n % k)
 
 @dataclass
 class LLaMAConfig:
@@ -156,10 +159,6 @@ class LLaMA(nn.Module):
 
     def reset_cache(self) -> None:
         self.kv_caches.clear()
-        if self.mask_cache.device.type == "xla":
-            # https://github.com/Lightning-AI/lit-parrot/pull/83#issuecomment-1558150179
-            self.rope_cache = None
-            self.mask_cache = None
 
 
 class Block(nn.Module):

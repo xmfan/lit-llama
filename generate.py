@@ -8,15 +8,18 @@ from typing import Optional
 import lightning as L
 import torch
 
-import torch._dynamo.config as config
-config.automatic_dynamic_shapes = False
+import torch._dynamo.config
+torch._dynamo.config.automatic_dynamic_shapes = False
+import torch._inductor.config
+torch._inductor.config.triton.unique_kernel_names = True
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_llama import LLaMA, Tokenizer
-from lit_llama.utils import lazy_load, llama_model_lookup, quantization
+from model import LLaMA
+from tokenizer import Tokenizer
+from utils import lazy_load, llama_model_lookup
 
 def fast_multinomial_sample_one(probs_sort):
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -130,10 +133,9 @@ def main(
     temperature: float = 0.8,
     checkpoint_path: Path = Path("checkpoints/lit-llama/7B/lit-llama.pth"),
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
-    quantize: Optional[str] = None,
     fake: bool = False,
     compile: bool = True,
-    profile: bool = False,
+    profile: Optional[Path] = None,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -161,7 +163,7 @@ def main(
     with lazy_load(checkpoint_path) as checkpoint:
         name = llama_model_lookup(checkpoint)
 
-        with fabric.init_module(empty_init=True), quantization(mode=quantize):
+        with fabric.init_module(empty_init=True):
             model = LLaMA.from_name(name)
 
         if not fake:
@@ -179,8 +181,9 @@ def main(
     L.seed_everything(1234)
     model_size = sum([p.numel() * p.data.element_size() for p in model.parameters()])
     if compile:
-        global decode_one_token
+        global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
+        # prefill = torch.compile(prefill, mode="reduce-overhead")
 
     for i in range(num_samples):
         torch.cuda.synchronize()
@@ -190,7 +193,7 @@ def main(
         with prof:
             y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
         if hasattr(prof, "export_chrome_trace"):
-            prof.export_chrome_trace(f"transformer.json")
+            prof.export_chrome_trace(f"{profile}.json")
         torch.cuda.synchronize()
         t = time.perf_counter() - t0
 
