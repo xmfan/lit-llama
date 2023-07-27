@@ -1,3 +1,4 @@
+from jsonargparse import CLI
 import sys
 import time
 import warnings
@@ -14,11 +15,51 @@ sys.path.append(str(wd))
 from lit_llama import LLaMA, Tokenizer
 from lit_llama.utils import lazy_load, llama_model_lookup, quantization
 
+def fast_multinomial_sample_one(probs_sort):
+    q = torch.empty_like(probs_sort).exponential_(1)
+    return torch.argmax(probs_sort / q, dim=-1, keepdim=True)
+
+# @torch.compile
+def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+    logits =  logits[0, -1] / temperature
+
+    # optionally crop the logits to only the top k options
+    if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits = torch.where(logits < v[-1], -float("Inf"), logits)
+
+
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    # print()
+    idx_next = fast_multinomial_sample_one(probs).to(dtype=torch.int)
+    # idx_next = torch.multinomial(probs, num_samples=1).to(dtype=torch.int)
+    return idx_next
+
+def prefill(
+    model: LLaMA,
+    input_pos: torch.Tensor,
+    x: torch.Tensor,
+    **kwargs
+):
+    # input_pos: [B, S]
+    logits = model(x, input_pos)
+    return sample(logits, **kwargs)
+
+def decode_one_token(
+    model: LLaMA,
+    input_pos: torch.Tensor,
+    x: torch.Tensor,
+    **kwargs
+) -> torch.Tensor:
+    # input_pos: [B, 1]
+    assert input_pos.shape[-1] == 1
+    logits = model(x, input_pos)
+    return sample(logits, **kwargs)
 
 @torch.no_grad()
 def generate(
     model: LLaMA,
-    idx: torch.Tensor,
+    prompt: torch.Tensor,
     max_new_tokens: int,
     *,
     max_seq_length: Optional[int] = None,
@@ -32,7 +73,7 @@ def generate(
 
     Args:
         model: The model to use.
-        idx: Tensor of shape (T) with indices of the prompt sequence.
+        prompt: Tensor of shape (T) with indices of the prompt sequence.
         max_new_tokens: The number of new tokens to generate.
         max_seq_length: The maximum sequence length allowed.
         temperature: Scales the predicted logits by 1 / temperature
@@ -40,51 +81,47 @@ def generate(
         eos_id: If specified, stop generating any more token once the <eos> token is triggered
     """
     # create an empty tensor of the expected final shape and fill in the current tokens
-    T = idx.size(0)
+    T = prompt.size(0)
     T_new = T + max_new_tokens
     if max_seq_length is None:
         max_seq_length = min(T_new, model.config.block_size)
     model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
-    device, dtype = idx.device, idx.dtype
+    device, dtype = prompt.device, prompt.dtype
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(T_new, dtype=dtype, device=device)
-    empty[:T] = idx
-    idx = empty
+    empty[:T] = prompt
+    seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+    next_token = prefill(model, input_pos, prompt.view(1, -1), temperature=temperature, top_k=top_k)
+    seq[T] = next_token
+
+    input_pos = torch.tensor([T], device=device, dtype=input_pos.dtype)
+
     # generate max_new_tokens tokens
-    for _ in range(max_new_tokens):
-        x = idx.index_select(0, input_pos).view(1, -1)
+    for _ in range(max_new_tokens - 1):
+        cur_token = next_token.view(1, -1)
 
         # forward
-        logits = model(x, input_pos)
-        logits = logits[0, -1] / temperature
-
-        # optionally crop the logits to only the top k options
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits = torch.where(logits < v[[-1]], -float("Inf"), logits)
-
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1).to(dtype=dtype)
+        next_token = decode_one_token(model, input_pos, cur_token, temperature=temperature, top_k=top_k)
 
         # advance
-        input_pos = input_pos[-1:] + 1
+        input_pos = input_pos + 1
 
         # concatenate the new generation
-        idx = idx.index_copy(0, input_pos, idx_next)
+        seq[input_pos] = next_token
 
         # if <eos> token is triggered, return the output (stop generation)
-        if idx_next == eos_id:
-            return idx[:input_pos]  # include the EOS token
+        if next_token == eos_id:
+            return seq[:input_pos]  # include the EOS token
 
-    return idx
+    return seq
 
 
 def main(
     prompt: str = "Hello, my name is",
-    *,
+    prompt_synthetic: Optional[int] = None,
     num_samples: int = 1,
     max_new_tokens: int = 50,
     top_k: int = 200,
@@ -92,7 +129,9 @@ def main(
     checkpoint_path: Path = Path("checkpoints/lit-llama/7B/lit-llama.pth"),
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
     quantize: Optional[str] = None,
-    fake_weights = False,
+    fake: bool = False,
+    compile: bool = True,
+    profile: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -123,7 +162,7 @@ def main(
         with fabric.init_module(empty_init=True), quantization(mode=quantize):
             model = LLaMA.from_name(name)
 
-        if not fake_weights:
+        if not fake:
             model.load_state_dict(checkpoint)
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
 
@@ -131,16 +170,21 @@ def main(
 
     tokenizer = Tokenizer(tokenizer_path)
     encoded = tokenizer.encode(prompt, bos=True, eos=False, device=fabric.device)
+    if prompt_synthetic is not None:
+        encoded = torch.randint(encoded.amax().item(), (prompt_synthetic,), dtype=encoded.dtype, device=encoded.device)
     prompt_length = encoded.size(0)
 
     L.seed_everything(1234)
     model_size = sum([p.numel() * p.data.element_size() for p in model.parameters()])
-    model = torch.compile(model)
+    if compile:
+        global decode_one_token
+        decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
+    #     model = torch.compile(model, mode="reduce-overhead")
     for i in range(num_samples):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         import contextlib
-        prof = contextlib.nullcontext() if i != -1 else torch.profiler.profile()
+        prof = contextlib.nullcontext() if i != num_samples - 1 or not profile else torch.profiler.profile()
         with prof:
             y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
         if hasattr(prof, "export_chrome_trace"):

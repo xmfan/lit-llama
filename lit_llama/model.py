@@ -45,6 +45,28 @@ llama_configs = {
     "65B": dict(n_layer=80, n_head=64, n_embd=8192),
 }
 
+# HACK: Dynamo doesn't handle list mutation of module attributes properly now, so making it a global
+class KVCache(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.k_caches = nn.ParameterList([])
+        self.v_caches = nn.ParameterList([])
+
+    def initialize(self,layers, max_batch_size, max_seq_length, n_heads, head_size, device='cuda', dtype=torch.bfloat16):
+        cache_shape = (max_batch_size, n_heads, max_seq_length, head_size)
+        self.k_caches = nn.ParameterList([torch.zeros(cache_shape, device=device, dtype=dtype) for _ in range(layers)])
+        self.v_caches = nn.ParameterList([torch.zeros(cache_shape, device=device, dtype=dtype) for _ in range(layers)])
+
+    def __getitem__(self, idx):
+        return self.k_caches[idx], self.v_caches[idx]
+
+    def clear(self):
+        self.k_caches = nn.ParameterList([])
+        self.v_caches = nn.ParameterList([])
+
+    def update(self, layer, k_val, v_val):
+        self.k_caches[layer].copy_(k_val)
+        self.v_caches[layer].copy_(v_val)
 
 class LLaMA(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -63,20 +85,19 @@ class LLaMA(nn.Module):
 
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[MaskCache] = None
-        self.kv_caches: List[KVCache] = []
+        self.kv_caches = KVCache()
         self.max_batch_size = None
         self.max_seq_length = None
-        # self.compile(mode="reduce-overhead")
 
     def setup_caches(self, max_batch_size, max_seq_length, device='cuda', dtype=torch.bfloat16):
         head_size = self.config.n_embd // self.config.n_head
-        cache_shape = (max_batch_size, self.config.n_head, max_seq_length, head_size)
+
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
-        self.kv_caches = [
-            (torch.zeros(cache_shape, device=device, dtype=dtype), torch.zeros(cache_shape, device=device, dtype=dtype))
-            for _ in range(self.config.n_layer)
-        ]
+        self.kv_caches.initialize(layers=self.config.n_layer, max_batch_size=max_batch_size, max_seq_length=max_seq_length, n_heads=self.config.n_head, head_size=head_size)
+        # for _ in range(self.config.n_layer):
+        #     self.kv_caches.append((torch.zeros(cache_shape, device=device, dtype=dtype), torch.zeros(cache_shape, device=device, dtype=dtype)))
+
         self.rope_cache = build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=self.config.n_embd // self.config.n_head,
@@ -122,8 +143,8 @@ class LLaMA(nn.Module):
         else:
             for i, block in enumerate(self.transformer.h):
                 x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
-                self.kv_caches[i][0].copy_(new_kv_cache[0])
-                self.kv_caches[i][1].copy_(new_kv_cache[1])
+                self.kv_caches.update(i, new_kv_cache[0], new_kv_cache[1])
+                # kv_caches[i] = new_kv_cache
 
         x = self.transformer.ln_f(x)
 
@@ -209,11 +230,6 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             # check if reached token limit
-            # if input_pos[-1] >= max_seq_length:
-            #     input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
-            #     # shift 1 position to the left
-            #     cache_k = torch.roll(cache_k, -1, dims=2)
-            #     cache_v = torch.roll(cache_v, -1, dims=2)
 
             k = cache_k.index_copy(2, input_pos, k)
             v = cache_v.index_copy(2, input_pos, v)
@@ -227,7 +243,7 @@ class CausalSelfAttention(nn.Module):
 
         # efficient attention using Flash Attention CUDA kernels
         # breakpoint
-        # y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # y = F.scaled_dot_product_attention(q, k, v)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
