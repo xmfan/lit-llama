@@ -4,6 +4,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Optional
+import itertools
 
 import lightning as L
 import torch
@@ -174,6 +175,7 @@ def main(
             model.load_state_dict(checkpoint)
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
 
+
     model.eval()
 
     tokenizer = Tokenizer(tokenizer_path)
@@ -183,7 +185,7 @@ def main(
     prompt_length = encoded.size(0)
 
     L.seed_everything(1234)
-    model_size = sum([p.numel() * p.data.element_size() for p in model.parameters()])
+    model_size = sum([p.numel() * p.data.element_size() for p in itertools.chain(model.parameters(), model.buffers())])
     if compile:
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")

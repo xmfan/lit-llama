@@ -23,6 +23,30 @@ def find_multiple(n: int, k: int) -> int:
         return n
     return n + k - (n % k)
 
+class LinearInt8(torch.nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 device=None, dtype=None) -> None:
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
+        # if bias:
+        #     self.register_buffer("bias", torch.empty(out_features, **factory_kwargs, dtype=torch.int8))
+        # else:
+        #     self.bias('bias', None)
+
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.linear(input, self.weight.to(dtype=input.dtype))
+
+# nn.Linear = LinearInt8
+
 @dataclass
 class LLaMAConfig:
     block_size: int = 2048
@@ -64,7 +88,6 @@ class KVCache(nn.Module):
 
         return self.k_cache, self.v_cache
 
-# HACK: Dynamo doesn't handle list mutation of module attributes properly now, so making it a global
 class KVCacheAggregator(nn.Module):
     def __init__(self):
         super().__init__()
