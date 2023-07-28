@@ -32,4 +32,11 @@ Bandwidth achieved: 1012.55 GB/s
 Refactored to also compile sampling code (and also updated pytorch)
 Time for inference 3: 1.16 sec total, 86.02 tokens/sec
 Bandwidth achieved: 1159.24 GB/s
+
+After enabling cudagraphs, changing kv-cache to be a scatter instead of full copy, and some optimizations in Inductor (such as reinplacing index_put)
+
+Time for inference 5: 0.94 sec total, 106.79 tokens/sec
+Bandwidth achieved: 1439.13 GB/s
 ```
+
+Note: Running on an A100 80GB, albeit power-limited to 330 watts. Empirically, seems like peak bandwidth is about 1700 GB/s.

@@ -9,9 +9,12 @@ import lightning as L
 import torch
 
 import torch._dynamo.config
-torch._dynamo.config.automatic_dynamic_shapes = False
+torch._dynamo.config.automatic_dynamic_shapes = True
 import torch._inductor.config
 torch._inductor.config.triton.unique_kernel_names = True
+
+# Enable this to bring perf from 93 tok/s => 103 tok/s
+# increases compile time due to coord descent autotuning + compiling both prefill and decode steps
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -136,6 +139,7 @@ def main(
     fake: bool = False,
     compile: bool = True,
     profile: Optional[Path] = None,
+    max_optimize: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -183,7 +187,12 @@ def main(
     if compile:
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
-        # prefill = torch.compile(prefill, mode="reduce-overhead")
+
+        # Apparently compiling only prefill but not decode gives bunk results???
+        if max_optimize:
+            prefill = torch.compile(prefill, mode="reduce-overhead")
+            torch._inductor.config.coordinate_descent_tuning = True
+
 
     for i in range(num_samples):
         torch.cuda.synchronize()
