@@ -14,7 +14,7 @@ git clone https://huggingface.co/openlm-research/open_llama_7b checkpoints/open-
 Or if you don't have `git-lfs` installed:
 
 ```bash
-python scripts/download.py --repo_id openlm-research/open_llama_7b --local_dir checkpoints/open-llama/7B
+python download.py --repo_id openlm-research/open_llama_7b --local_dir checkpoints/open-llama/7B
 ```
 
 Once downloaded, you should have a folder like this:
@@ -32,7 +32,7 @@ checkpoints/open-llama/
 Convert the weights to the Lit-LLaMA format:
 
 ```bash
-python scripts/convert_hf_checkpoint.py --checkpoint_dir checkpoints/open-llama/7B --model_size 7B
+python convert_hf_checkpoint.py --checkpoint_dir checkpoints/open-llama/7B --model_size 7B
 ```
 
 ### Original Meta weights
@@ -54,7 +54,7 @@ checkpoints/llama
 Convert the weights to the Lit-LLaMA format:
 
 ```bash
-python scripts/convert_checkpoint.py --model_size 7B
+python convert_checkpoint.py --model_size 7B
 ```
 
 > **Note**
@@ -91,7 +91,7 @@ git clone REPO_ID checkpoints/hf-llama/7B
 Or if you don't have `git-lfs` installed:
 
 ```bash
-python scripts/download.py --repo_id REPO_ID --local_dir checkpoints/hf-llama/7B
+python download.py --repo_id REPO_ID --local_dir checkpoints/hf-llama/7B
 ```
 
 Once downloaded, you should have a folder like this:
@@ -109,7 +109,7 @@ checkpoints/hf-llama/
 Convert the weights to the Lit-LLaMA format:
 
 ```bash
-python scripts/convert_hf_checkpoint.py --model_size 7B
+python convert_hf_checkpoint.py --model_size 7B
 ```
 
 > **Note**
