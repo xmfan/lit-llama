@@ -23,30 +23,6 @@ def find_multiple(n: int, k: int) -> int:
         return n
     return n + k - (n % k)
 
-class LinearInt8(torch.nn.Module):
-    __constants__ = ['in_features', 'out_features']
-    in_features: int
-    out_features: int
-    weight: torch.Tensor
-
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 device=None, dtype=None) -> None:
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.int8))
-        # if bias:
-        #     self.register_buffer("bias", torch.empty(out_features, **factory_kwargs, dtype=torch.int8))
-        # else:
-        #     self.bias('bias', None)
-
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype))
-
-# nn.Linear = LinearInt8
-
 @dataclass
 class LLaMAConfig:
     block_size: int = 2048
@@ -104,6 +80,30 @@ class KVCacheAggregator(nn.Module):
         self.kv_caches = nn.ParameterList([])
 
 class LLaMA(nn.Module):
+    """
+    LLaMA Language Model
+    └── Input (Token IDs)
+        │
+        ├── Positional Embeddings (RoPE)
+        │
+        ├── Transformer Blocks (x32, from llama_config n_layer)
+        │     │
+        │     ├── Causal Self-Attention
+        │     │     │
+        │     │     ├── Key, Query, Value Projections
+        │     │     │
+        │     │     ├── Rotary Positional Embeddings
+        │     │     │
+        │     │     └── Attention Calculation
+        │     │
+        │     ├── Feedforward Neural Network (MLP)
+        │     │
+        │     └── Residual Connection and Layer Normalization
+        │
+        ├── Linear Projection to Vocabulary Size
+        │
+        └── Output (Logits)
+    """
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
@@ -167,11 +167,14 @@ class LLaMA(nn.Module):
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
+        # Transformer
         for i, block in enumerate(self.transformer.h):
             x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
 
+        # (Residual Connection?) and Layer Normalization
         x = self.transformer.ln_f(x)
 
+        # Linear Projection to Vocabulary Size
         logits = self.lm_head(x)  # (b, t, vocab_size)
 
         return logits
@@ -201,8 +204,10 @@ class Block(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        # Self-attention
         h, new_kv_cache = self.attn(self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache)
         x = x + h
+        # MLP
         x = x + self.mlp(self.rms_2(x))
         return x, new_kv_cache
 
@@ -233,6 +238,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # TODO: distribute this
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
         head_size = C // self.n_head
@@ -263,6 +269,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
+        # TODO: distribute this
         y = self.c_proj(y)
 
         return y, kv_cache
@@ -280,7 +287,11 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
+        # TODO: distribute this
+        kq = self.c_fc1(x)
+        v = self.c_fc2(x)
+        x = F.silu(kq) * v
+        # TODO: distribute this
         x = self.c_proj(x)
         return x
 
