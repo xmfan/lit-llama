@@ -23,6 +23,9 @@ llama_model_sizes = {
     8192: "65B",  # 65B n_embd=8192
 }
 
+# provided by torchrun
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK"))
+LOCAL_WORLD_SIZE = int(os.environ.get("LOCAL_WORLD_SIZE"))
 
 def llama_model_lookup(checkpoint: dict) -> str:
     """Returns the LLaMA model name from the checkpoint.
@@ -66,23 +69,6 @@ def save_model_checkpoint(fabric, model, file_path):
     if fabric.global_rank == 0:
         torch.save(state_dict, file_path)
     fabric.barrier()
-
-@functools.lru_cache(maxsize=1)
-def get_local_rank() -> int:
-    # provided by torchrun
-    if 'LOCAL_RANK' in os.environ:
-        return int(os.environ['LOCAL_RANK'])
-
-    return 0
-
-@functools.lru_cache(maxsize=1)
-def get_local_world_size() -> int:
-    # provided by torchrun
-    if 'LOCAL_WORLD_SIZE' in os.environ:
-        return int(os.environ['LOCAL_WORLD_SIZE'])
-
-    return 1
-
 
 class EmptyInitOnDevice(torch.overrides.TorchFunctionMode):
     def __init__(self, device=None, dtype=None, quantization_mode=None):

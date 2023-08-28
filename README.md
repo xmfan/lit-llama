@@ -5,7 +5,7 @@ To run benchmark.
 Model definition in `model.py`, generation code in `generate.py`.
 
 ```
-time python generate.py --prompt "Hello, my name is" --max_new_tokens 200 --num_samples 10 --fake false  --compile true
+time torchrun --standalone --nproc_per_node=1 generate.py --prompt "Hello, my name is" --max_new_tokens 200 --num_samples 10 --fake false  --compile true
 ```
 
 ```

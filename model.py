@@ -10,11 +10,11 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
+from torch.distributed import _functional_collectives as collectives
 from torch.nn import functional as F
 from typing_extensions import Self
 
-from utils import get_local_rank, get_local_world_size
+from utils import LOCAL_RANK, LOCAL_WORLD_SIZE
 
 
 
@@ -292,25 +292,23 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
         x = self.c_proj(x)
-        if get_local_world_size() > 1:
-            dist.all_reduce(x)
-
+        collectives.all_reduce(x, "sum", list(range(LOCAL_WORLD_SIZE)))
         return x
 
     def shard_state(self) -> None:
         # Column-wise sharding, once weights are loaded
         for fc in [self.c_fc1, self.c_fc2]:
-            assert fc.out_features % get_local_world_size() == 0
-            fc.out_features = fc.out_features // get_local_world_size()
+            assert fc.out_features % LOCAL_WORLD_SIZE == 0
+            fc.out_features = fc.out_features // LOCAL_WORLD_SIZE
             # Shard on dim 0 since fc.weight is transposed
-            fc.weight = nn.Parameter(torch.tensor_split(fc.weight, get_local_world_size(), dim=0)[get_local_rank()])
+            fc.weight = nn.Parameter(torch.tensor_split(fc.weight, LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK])
             assert(fc.weight.shape == (fc.out_features, fc.in_features))
 
         proj = self.c_proj
-        assert proj.in_features % get_local_world_size() == 0
-        proj.in_features = proj.in_features // get_local_world_size()
+        assert proj.in_features % LOCAL_WORLD_SIZE == 0
+        proj.in_features = proj.in_features // LOCAL_WORLD_SIZE
         # Shard on dim 1 since c_proj.weight is transposed
-        proj.weight = nn.Parameter(torch.tensor_split(proj.weight, get_local_world_size(), dim=1)[get_local_rank()])
+        proj.weight = nn.Parameter(torch.tensor_split(proj.weight, LOCAL_WORLD_SIZE, dim=1)[LOCAL_RANK])
         assert(proj.weight.shape == (proj.out_features, proj.in_features))
 
 
