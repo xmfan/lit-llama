@@ -3,6 +3,7 @@
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 """
 # mypy: ignore-errors
+import os
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -12,6 +13,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
 MaskCache = torch.Tensor
@@ -193,7 +196,7 @@ class Block(nn.Module):
         self.rms_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.rms_2 = RMSNorm(config.n_embd)
-        self.mlp = MLP(config)
+        self.mlp = MLP_TP(config)
 
     def forward(
         self,
@@ -275,25 +278,78 @@ class CausalSelfAttention(nn.Module):
         return y, kv_cache
 
 
-class MLP(nn.Module):
+def mlp_forward_tp(rank, x, results_queue):
+    n_gpus = 8
+    dist.init_process_group(backend="nccl", rank=rank, world_size=n_gpus)
+
+    x = x.cuda(rank) # (1, 6, 4096)
+
+    # for llama-7b
+    # keep feature dim 4096
+    # split hidden dim 11008 8-way: 1376
+    c_fc1 = nn.Linear(4096, 1376, bias=False, device=rank, dtype=x.dtype)
+    c_fc2 = nn.Linear(4096, 1376, bias=False, device=rank, dtype=x.dtype)
+
+    kq = c_fc1(x) # (1, 6, 1376)
+    v = c_fc2(x) # (1, 6, 1376)
+    x = F.silu(kq) * v # (1, 6, 1376)
+
+    outputs = [torch.zeros(x.shape, device=rank, dtype=x.dtype) for _ in range(n_gpus)]
+    dist.all_gather(outputs, x)
+    output = torch.cat(outputs, dim=2) # (1, 6, 11008)
+
+    torch.cuda.synchronize()
+
+    if rank == 0:
+        print(f"rank={rank}, done compute")
+        # compute on all ranks for now
+        c_proj = nn.Linear(11008, 4096, bias=False, device=rank, dtype=x.dtype)
+        print(f"rank={rank}, applying classifier")
+        output = c_proj(output) # (1, 6, 4096)
+        print(f"rank={rank}, inserting into results_queue")
+        torch.cuda.synchronize()
+        results_queue.put(1)
+        print(f"rank={rank}, inserted into results_queue")
+
+
+class MLP_TP(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
         super().__init__()
-        hidden_dim = 4 * config.n_embd
-        n_hidden = int(2 * hidden_dim / 3)
-        n_hidden = find_multiple(n_hidden, 256)
+        # hidden_dim = 4 * config.n_embd
+        # n_hidden = int(2 * hidden_dim / 3)
+        # n_hidden = find_multiple(n_hidden, 256)
 
-        self.c_fc1 = nn.Linear(config.n_embd, n_hidden, bias=False)
-        self.c_fc2 = nn.Linear(config.n_embd, n_hidden, bias=False)
-        self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
+        # # 4096 -> 11008
+        # self.c_fc1 = Linear_TP(config.n_embd, n_hidden, bias=False)
+        # self.c_fc2 = Linear_TP(config.n_embd, n_hidden, bias=False)
+        # # 11008 -> 4096
+        # self.c_proj = Linear_TP(n_hidden, config.n_embd, bias=False)
+        self.setup_tp()
+
+    def setup_tp(self):
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29501"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO: distribute this
-        kq = self.c_fc1(x)
-        v = self.c_fc2(x)
-        x = F.silu(kq) * v
-        # TODO: distribute this
-        x = self.c_proj(x)
-        return x
+        # input shape is (1, 6, 4096) (b, seq, feature)
+
+        results_queue = mp.Queue()
+        mp.spawn(mlp_forward_tp, args=(x, results_queue,), nprocs=8, join=True)
+
+        if results_queue.empty():
+            raise RuntimeError("No results from MLP_TP")
+
+        print("retrieving results queue item")
+        output = results_queue.get()
+        results_queue.task_done()
+        # kq = self.c_fc1(x)
+        # v = self.c_fc2(x)
+        # x = F.silu(kq) * v
+        # x = self.c_proj(x)
+
+        # output shape is (1, 6, 4096) (b, seq, feature)
+        print(f"main process received output.shape={output.shape}")
+        return output
 
 
 class RMSNorm(nn.Module):
