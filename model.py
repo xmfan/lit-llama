@@ -292,7 +292,8 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
         x = self.c_proj(x)
-        collectives.all_reduce(x, "sum", list(range(LOCAL_WORLD_SIZE)))
+        x = collectives.all_reduce(x, "sum", list(range(LOCAL_WORLD_SIZE)))
+
         return x
 
     def shard_state(self) -> None:
