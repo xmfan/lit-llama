@@ -1,5 +1,6 @@
 """Utility functions for training and inference."""
 
+import os
 import functools
 import pickle
 import warnings
@@ -25,7 +26,7 @@ llama_model_sizes = {
 
 def llama_model_lookup(checkpoint: dict) -> str:
     """Returns the LLaMA model name from the checkpoint.
-    
+
     Checks the width of the lm_head.weight matrix, as these uniquely identify the model.
     """
     embedding_size = checkpoint['transformer.wte.weight'].shape[1]
@@ -40,7 +41,7 @@ def find_multiple(n: int, k: int) -> int:
 
 def save_model_checkpoint(fabric, model, file_path):
     """Handles boilerplate logic for retrieving and saving the state_dict.
-    
+
     This will be upstreamed to Fabric soon.
     """
     file_path = Path(file_path)
@@ -65,6 +66,22 @@ def save_model_checkpoint(fabric, model, file_path):
     if fabric.global_rank == 0:
         torch.save(state_dict, file_path)
     fabric.barrier()
+
+@functools.lru_cache(maxsize=1)
+def get_local_rank() -> int:
+    # provided by torchrun
+    if 'LOCAL_RANK' in os.environ:
+        return int(os.environ['LOCAL_RANK'])
+
+    return 0
+
+@functools.lru_cache(maxsize=1)
+def get_local_world_size() -> int:
+    # provided by torchrun
+    if 'LOCAL_WORLD_SIZE' in os.environ:
+        return int(os.environ['LOCAL_WORLD_SIZE'])
+
+    return 1
 
 
 class EmptyInitOnDevice(torch.overrides.TorchFunctionMode):

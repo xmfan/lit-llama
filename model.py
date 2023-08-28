@@ -3,14 +3,18 @@
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 """
 # mypy: ignore-errors
+import os
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.nn import functional as F
 from typing_extensions import Self
+
+from utils import get_local_rank, get_local_world_size
 
 
 
@@ -183,6 +187,10 @@ class LLaMA(nn.Module):
     def reset_cache(self) -> None:
         self.kv_caches.clear()
 
+    def shard_state(self) -> None:
+        for block in self.transformer.h:
+            block.shard_state()
+
 
 class Block(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -206,6 +214,8 @@ class Block(nn.Module):
         x = x + self.mlp(self.rms_2(x))
         return x, new_kv_cache
 
+    def shard_state(self) -> None:
+        self.mlp.shard_state()
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -282,7 +292,26 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.silu(self.c_fc1(x)) * self.c_fc2(x)
         x = self.c_proj(x)
+        if get_local_world_size() > 1:
+            dist.all_reduce(x)
+
         return x
+
+    def shard_state(self) -> None:
+        # Column-wise sharding, once weights are loaded
+        for fc in [self.c_fc1, self.c_fc2]:
+            assert fc.out_features % get_local_world_size() == 0
+            fc.out_features = fc.out_features // get_local_world_size()
+            # Shard on dim 0 since fc.weight is transposed
+            fc.weight = nn.Parameter(torch.tensor_split(fc.weight, get_local_world_size(), dim=0)[get_local_rank()])
+            assert(fc.weight.shape == (fc.out_features, fc.in_features))
+
+        proj = self.c_proj
+        assert proj.in_features % get_local_world_size() == 0
+        proj.in_features = proj.in_features // get_local_world_size()
+        # Shard on dim 1 since c_proj.weight is transposed
+        proj.weight = nn.Parameter(torch.tensor_split(proj.weight, get_local_world_size(), dim=1)[get_local_rank()])
+        assert(proj.weight.shape == (proj.out_features, proj.in_features))
 
 
 class RMSNorm(nn.Module):

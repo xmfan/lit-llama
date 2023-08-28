@@ -1,4 +1,5 @@
 from jsonargparse import CLI
+import os
 import sys
 import time
 import warnings
@@ -8,6 +9,7 @@ import itertools
 
 import lightning as L
 import torch
+import torch.distributed as dist
 
 import torch._dynamo.config
 torch._dynamo.config.automatic_dynamic_shapes = True
@@ -23,7 +25,7 @@ sys.path.append(str(wd))
 
 from model import LLaMA
 from tokenizer import Tokenizer
-from utils import lazy_load, llama_model_lookup
+from utils import lazy_load, llama_model_lookup, get_local_rank, get_local_world_size
 
 def fast_multinomial_sample_one(probs_sort):
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -161,7 +163,7 @@ def main(
     assert tokenizer_path.is_file(), tokenizer_path
 
     precision = "bf16-true" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "32-true"
-    fabric = L.Fabric(devices=1, precision=precision)
+    fabric = L.Fabric(devices=[get_local_rank()], precision=precision)
 
     print("Loading model ...", file=sys.stderr)
     t0 = time.time()
@@ -173,6 +175,11 @@ def main(
 
         if not fake:
             model.load_state_dict(checkpoint)
+
+        # Shard weights across local ranks
+        if get_local_world_size() > 1:
+            model.shard_state()
+
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
 
 
@@ -203,23 +210,30 @@ def main(
         prof = contextlib.nullcontext() if i != num_samples - 1 or not profile else torch.profiler.profile()
         with prof:
             y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
-        if hasattr(prof, "export_chrome_trace"):
+        if get_local_rank() == 0 and hasattr(prof, "export_chrome_trace"):
             prof.export_chrome_trace(f"{profile}.json")
         torch.cuda.synchronize()
         t = time.perf_counter() - t0
 
         model.reset_cache()
-        print(tokenizer.decode(y))
-        tokens_generated = y.size(0) - prompt_length
-        tokens_sec = tokens_generated / t
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
-        print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
 
-    print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)
+        if get_local_rank() == 0:
+            print(tokenizer.decode(y))
+            tokens_generated = y.size(0) - prompt_length
+            tokens_sec = tokens_generated / t
+            print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
+            print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+
+    if get_local_rank() == 0:
+        print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)
 
 
 if __name__ == "__main__":
     from jsonargparse import CLI
+
+    if get_local_world_size() > 1:
+        dist.init_process_group(backend="nccl", rank=get_local_rank(), world_size=get_local_world_size())
+        torch.cuda.set_device(get_local_rank())
 
     torch.set_float32_matmul_precision("high")
     warnings.filterwarnings(
