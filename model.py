@@ -215,6 +215,7 @@ class Block(nn.Module):
         return x, new_kv_cache
 
     def shard_state(self) -> None:
+        self.attn.shard_state()
         self.mlp.shard_state()
 
 class CausalSelfAttention(nn.Module):
@@ -243,7 +244,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        temp = self.c_attn(x)
+        temp = collectives.all_gather_tensor(temp, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
+        q, k, v = temp.split(self.n_embd, dim=2)
 
         head_size = C // self.n_head
         k = k.view(B, T, self.n_head, head_size)
@@ -258,7 +261,7 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, nh, T, hs)
 
         if kv_cache is not None:
-            k, v = kv_cache.update(input_pos, k, v)
+            k, v = kv_cache.update(input_pos, k, v) # (B, nh, max_seq_length, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         #  att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -274,8 +277,17 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.c_proj(y)
+        y = collectives.all_gather_tensor(y, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
 
         return y, kv_cache
+
+    def shard_state(self) -> None:
+        for layer in [self.c_attn, self.c_proj]:
+            assert layer.out_features % LOCAL_WORLD_SIZE == 0
+            layer.out_features = layer.out_features // LOCAL_WORLD_SIZE
+            # Shard on dim 0 since layer.weight is transposed
+            layer.weight = nn.Parameter(torch.tensor_split(layer.weight, LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK])
+            assert(layer.weight.shape == (layer.out_features, layer.in_features))
 
 
 class MLP(nn.Module):
@@ -297,7 +309,7 @@ class MLP(nn.Module):
         return x
 
     def shard_state(self) -> None:
-        # Column-wise sharding, once weights are loaded
+        # Column-wise sharding
         for fc in [self.c_fc1, self.c_fc2]:
             assert fc.out_features % LOCAL_WORLD_SIZE == 0
             fc.out_features = fc.out_features // LOCAL_WORLD_SIZE
@@ -305,6 +317,7 @@ class MLP(nn.Module):
             fc.weight = nn.Parameter(torch.tensor_split(fc.weight, LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK])
             assert(fc.weight.shape == (fc.out_features, fc.in_features))
 
+        # Row-wise sharding
         proj = self.c_proj
         assert proj.in_features % LOCAL_WORLD_SIZE == 0
         proj.in_features = proj.in_features // LOCAL_WORLD_SIZE
