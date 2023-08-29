@@ -178,6 +178,7 @@ def main(
 
         # Shard weights across local ranks
         if LOCAL_WORLD_SIZE > 1:
+            print("Sharing model weights ...")
             model.shard_state()
 
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)

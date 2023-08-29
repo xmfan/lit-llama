@@ -129,7 +129,7 @@ class LLaMA(nn.Module):
         self.max_seq_length = None
 
     def setup_caches(self, max_batch_size, max_seq_length, device='cuda', dtype=torch.bfloat16):
-        head_size = self.config.n_embd // self.config.n_head
+        head_size = (self.config.n_embd // self.config.n_head) // LOCAL_WORLD_SIZE
 
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
@@ -137,7 +137,7 @@ class LLaMA(nn.Module):
 
         self.rope_cache = build_rope_cache(
             seq_len=self.config.block_size,
-            n_elem=self.config.n_embd // self.config.n_head,
+            n_elem=(self.config.n_embd // self.config.n_head) // LOCAL_WORLD_SIZE,
             dtype=dtype,
             device=device,
         )
@@ -164,9 +164,17 @@ class LLaMA(nn.Module):
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
-        rope = self.rope_cache.index_select(0, input_pos)
-        mask = self.mask_cache.index_select(2, input_pos)
-        mask = mask[:, :, :, :max_seq_length]
+        rope = self.rope_cache.index_select(0, input_pos) # B, 8, 2
+        mask = self.mask_cache.index_select(2, input_pos) # 1, 1, B, 2048
+        mask = mask[:, :, :, :max_seq_length] # 1, 1, B, 206
+
+        """
+        rope_cache.shape=torch.Size([2048, 8, 2])
+        rope.shape=torch.Size([B, 8, 2])
+        mask_cache.shape=torch.Size([1, 1, 2048, 2048])
+        before mask.shape=torch.Size([1, 1, B, 2048])
+        after mask.shape=torch.Size([1, 1, B, 206])
+        """
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
@@ -242,13 +250,14 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        _C = C // LOCAL_WORLD_SIZE # sharded embedding dimensionality (n_embd / ws), ws = world size
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        temp = self.c_attn(x)
-        temp = collectives.all_gather_tensor(temp, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
-        q, k, v = temp.split(self.n_embd, dim=2)
+        temp = self.c_attn(x) # (B, T, 3*_C)
+        # temp = collectives.all_gather_tensor(temp, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
+        q, k, v = temp.split(_C, dim=2) # (B, T, _C)
 
-        head_size = C // self.n_head
+        head_size = _C // self.n_head
         k = k.view(B, T, self.n_head, head_size)
         q = q.view(B, T, self.n_head, head_size)
         v = v.view(B, T, self.n_head, head_size)
@@ -273,21 +282,40 @@ class CausalSelfAttention(nn.Module):
         # y = F.scaled_dot_product_attention(q, k, v)
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, _C)  # re-assemble all head outputs side by side
 
         # output projection
         y = self.c_proj(y)
-        y = collectives.all_gather_tensor(y, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
+        # y = collectives.all_gather_tensor(y, gather_dim=2, group=list(range(LOCAL_WORLD_SIZE)))
+        y = collectives.all_reduce(y, "sum", list(range(LOCAL_WORLD_SIZE)))
 
         return y, kv_cache
 
     def shard_state(self) -> None:
-        for layer in [self.c_attn, self.c_proj]:
-            assert layer.out_features % LOCAL_WORLD_SIZE == 0
-            layer.out_features = layer.out_features // LOCAL_WORLD_SIZE
-            # Shard on dim 0 since layer.weight is transposed
-            layer.weight = nn.Parameter(torch.tensor_split(layer.weight, LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK])
-            assert(layer.weight.shape == (layer.out_features, layer.in_features))
+        attn = self.c_attn
+        assert attn.in_features % LOCAL_WORLD_SIZE == 0 # q, k, v must be shardeable
+        attn.out_features = attn.out_features // LOCAL_WORLD_SIZE
+        assert attn.out_features == 1536 # TODO: remove
+        # Shard on dim 0 since attn.weight is transposed
+        # Shard q, k, v separately
+        q, k, v = attn.weight.split(attn.in_features, dim=0) # (C, C)
+        assert q.shape == (4096, 4096) # TODO: remove
+        q = q.split(attn.in_features // LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK] # (C/ws, C)
+        assert q.shape == (512, 4096) # TODO: remove
+        k = k.split(attn.in_features // LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK] # (C/ws, C)
+        v = v.split(attn.in_features // LOCAL_WORLD_SIZE, dim=0)[LOCAL_RANK] # (C/ws, C)
+        attn.weight = nn.Parameter(torch.cat((q, k, v))) # (3*C/ws, C)
+        assert attn.weight.shape == (1536, 4096) # TODO: remove
+        assert(attn.weight.shape == (attn.out_features, attn.in_features))
+
+        # Row-wise sharding
+        proj = self.c_proj
+        assert proj.in_features % LOCAL_WORLD_SIZE == 0
+        proj.in_features = proj.in_features // LOCAL_WORLD_SIZE
+        # Shard on dim 1 since c_proj.weight is transposed
+        proj.weight = nn.Parameter(torch.tensor_split(proj.weight, LOCAL_WORLD_SIZE, dim=1)[LOCAL_RANK])
+        assert(proj.weight.shape == (proj.out_features, proj.in_features))
+
 
 
 class MLP(nn.Module):
